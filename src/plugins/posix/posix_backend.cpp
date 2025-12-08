@@ -19,12 +19,18 @@
 #include <cmath>
 #include <errno.h>
 #include <stdexcept>
+#include <thread>
 #include "posix_backend.h"
 #include <absl/log/log.h>
 #include <absl/strings/str_format.h>
 #include "common/nixl_log.h"
 #include "nixl_types.h"
 #include "file/file_utils.h"
+
+const size_t DEF_NUM_THREADS = 1;
+const size_t MIN_NUM_THREADS = 1;
+const uint32_t DEF_MAX_IOS = 1024;
+const uint32_t MIN_MAX_IOS = 64;
 
 namespace {
 bool
@@ -72,6 +78,55 @@ castPosixHandle(nixlBackendReqH *handle) {
     return dynamic_cast<nixlPosixBackendReqH &>(*handle);
 }
 
+static uint32_t
+getNumThreads(const nixl_b_params_t *custom_params) {
+    uint32_t num_threads = DEF_NUM_THREADS;
+
+    // Check for explicit number of threads request
+    if (custom_params) {
+        if (custom_params->count("num_threads") > 0) {
+            const auto &value = custom_params->at("num_threads");
+            num_threads = std::stoul(value);
+
+            if (num_threads < MIN_NUM_THREADS) {
+                throw nixlPosixBackendReqH::exception("Number of threads must be at least " +
+                                                          std::to_string(MIN_NUM_THREADS),
+                                                      NIXL_ERR_INVALID_PARAM);
+            }
+
+            unsigned int num_cpus = std::thread::hardware_concurrency();
+            if (num_threads > num_cpus) {
+                NIXL_INFO << absl::StrFormat(
+                    "Number of threads (%zu) exceeds the number of CPUs (%u), using %u threads",
+                    num_threads,
+                    num_cpus,
+                    num_cpus);
+                num_threads = num_cpus;
+            }
+        }
+    }
+
+    return num_threads;
+}
+
+uint32_t
+getMaxIOS(const nixl_b_params_t *custom_params) {
+    uint32_t max_ios = DEF_MAX_IOS;
+    if (custom_params) {
+        if (custom_params->count("max_ios") > 0) {
+            const auto &value = custom_params->at("max_ios");
+            max_ios = std::stoul(value);
+
+            if (max_ios < MIN_MAX_IOS) {
+                throw nixlPosixBackendReqH::exception("Max I/O count must be at least " +
+                                                          std::to_string(MIN_MAX_IOS),
+                                                      NIXL_ERR_INVALID_PARAM);
+            }
+        }
+    }
+    return max_ios;
+}
+
 static const char *
 getIoQueueType(const nixl_b_params_t *custom_params) {
     // Check for explicit backend request
@@ -104,7 +159,6 @@ getIoQueueType(const nixl_b_params_t *custom_params) {
         }
 #endif
     }
-
     return "AIO";
 }
 
@@ -132,6 +186,22 @@ logOnPercentStep(unsigned int completed, unsigned int total) {
 // POSIX Backend Request Handle Implementation
 // -----------------------------------------------------------------------------
 
+nixlPosixWork::nixlPosixWork(nixlPosixBackendReqH *req_h) : req_h_(req_h) {}
+
+bool
+nixlPosixWork::poll() {
+    return req_h_->pollXfer();
+}
+
+void
+nixlPosixWork::destroy() {
+    // Do nothing
+}
+
+// -----------------------------------------------------------------------------
+// POSIX Backend Request Handle Implementation
+// -----------------------------------------------------------------------------
+
 nixlPosixBackendReqH::nixlPosixBackendReqH(const nixl_xfer_op_t &op,
                                            const nixl_meta_dlist_t &loc,
                                            const nixl_meta_dlist_t &rem,
@@ -142,7 +212,9 @@ nixlPosixBackendReqH::nixlPosixBackendReqH(const nixl_xfer_op_t &op,
       remote(rem),
       opt_args(args),
       custom_params_(params),
-      queue_depth_(loc.descCount()) {
+      queue_depth_(loc.descCount()),
+      req_state_(ReqState::IDLE),
+      work_(this) {
 
     std::string io_queue_type = params->at("io_queue_type");
     if (io_queue_type.empty()) {
@@ -156,18 +228,15 @@ nixlPosixBackendReqH::nixlPosixBackendReqH(const nixl_xfer_op_t &op,
                                         remote.descCount()),
                         NIXL_ERR_INVALID_PARAM);
     }
-
-    nixl_status_t status = initIoQueue(io_queue_type);
-    if (status != NIXL_SUCCESS) {
-        throw exception(absl::StrFormat("Failed to initialize io queue: %s", io_queue_type),
-                        status);
-    }
 }
 
 void
 nixlPosixBackendReqH::ioDone(uint32_t data_size, int error) {
     num_confirmed_ios_++;
     logOnPercentStep(num_confirmed_ios_, queue_depth_);
+    if (num_confirmed_ios_ == static_cast<size_t>(queue_depth_)) {
+        req_state_ = ReqState::COMPLETED;
+    }
 }
 
 void
@@ -176,13 +245,72 @@ nixlPosixBackendReqH::ioDoneClb(void *ctx, uint32_t data_size, int error) {
     self->ioDone(data_size, error);
 }
 
+bool
+nixlPosixBackendReqH::pollXfer() {
+    assert(req_state_ != ReqState::IDLE);
+
+    if (req_state_ == ReqState::ENQUEUEING && enqueueXfer()) {
+        req_state_ = ReqState::IN_PROGRESS;
+    }
+
+    return req_state_ == ReqState::COMPLETED ? false : true;
+}
+
 nixl_status_t
-nixlPosixBackendReqH::initIoQueue(const std::string &io_queue_type) {
+nixlPosixBackendReqH::checkXfer() {
+    assert(req_state_ != ReqState::IDLE);
+
+    return req_state_ == ReqState::COMPLETED ? NIXL_SUCCESS : NIXL_IN_PROG;
+}
+
+bool
+nixlPosixBackendReqH::enqueueXfer() {
+    assert(req_state_ == ReqState::ENQUEUEING);
+
+    auto io_queue = thread_->ioQueue();
+    size_t count = 0;
+
+    for (auto [local_it, remote_it] = std::make_pair(local.begin(), remote.begin());
+         local_it != local.end() && remote_it != remote.end();
+         ++local_it, ++remote_it, ++count) {
+
+        if (count < num_submitted_ios_) {
+            // We have already submitted this IO, so skip it
+            continue;
+        }
+
+        nixl_status_t status = io_queue->enqueue(remote_it->devId,
+                                                 reinterpret_cast<void *>(local_it->addr),
+                                                 remote_it->len,
+                                                 remote_it->addr,
+                                                 operation == NIXL_READ,
+                                                 ioDoneClb,
+                                                 this);
+
+        if (status != NIXL_SUCCESS) {
+            // Currently we do not support partial submissions, so it's all or nothing
+            NIXL_ERROR << absl::StrFormat("Error preparing I/O operation: %d", status);
+            return false; // The IO has been partially submitted, so we need to retry
+        }
+
+        num_submitted_ios_++;
+    }
+
+    return true;
+}
+
+//-----------------------------------------------------------------------------
+// POSIX Work Queue Thread Implementation
+//-----------------------------------------------------------------------------
+
+nixl_status_t
+nixlPosixWorkQueueThread::initIoQueue(const std::string &io_queue_type, uint32_t max_ios) {
     try {
-        io_queue_ = nixlPosixIOQueue::instantiate(io_queue_type, queue_depth_);
+        io_queue_ = nixlPosixIOQueue::instantiate(io_queue_type, max_ios);
         if (!io_queue_) {
-            throw exception(absl::StrFormat("Failed to initialize io queue: %s", io_queue_type),
-                            NIXL_ERR_INVALID_PARAM);
+            throw nixlPosixBackendReqH::exception(
+                absl::StrFormat("Failed to initialize io queue: %s", io_queue_type),
+                NIXL_ERR_INVALID_PARAM);
         }
 
         return NIXL_SUCCESS;
@@ -197,48 +325,22 @@ nixlPosixBackendReqH::initIoQueue(const std::string &io_queue_type) {
     }
 }
 
-nixl_status_t
-nixlPosixBackendReqH::prepXfer() {
-    return NIXL_SUCCESS;
+nixlPosixWorkQueueThread::nixlPosixWorkQueueThread(const std::string &io_queue_type,
+                                                   uint32_t max_ios)
+    : nixlWorkQueueThread() {
+    nixl_status_t status = initIoQueue(io_queue_type, max_ios);
+    if (status != NIXL_SUCCESS) {
+        throw nixlPosixBackendReqH::exception(
+            absl::StrFormat("Failed to initialize io queue: %s", io_queue_type), status);
+    }
 }
 
-nixl_status_t
-nixlPosixBackendReqH::checkXfer() {
-    if (num_confirmed_ios_ == queue_depth_) {
-        return NIXL_SUCCESS;
-    }
-
+void
+nixlPosixWorkQueueThread::poll() {
     nixl_status_t status = io_queue_->poll();
     if (status < 0) {
-        return status;
+        NIXL_INFO << absl::StrFormat("Error polling io queue: %d", status);
     }
-
-    return NIXL_IN_PROG;
-}
-
-nixl_status_t
-nixlPosixBackendReqH::postXfer() {
-    num_confirmed_ios_ = 0;
-
-    for (auto [local_it, remote_it] = std::make_pair(local.begin(), remote.begin());
-         local_it != local.end() && remote_it != remote.end();
-         ++local_it, ++remote_it) {
-        nixl_status_t status = io_queue_->enqueue(remote_it->devId,
-                                                  reinterpret_cast<void *>(local_it->addr),
-                                                  remote_it->len,
-                                                  remote_it->addr,
-                                                  operation == NIXL_READ,
-                                                  ioDoneClb,
-                                                  this);
-
-        if (status != NIXL_SUCCESS) {
-            // Currently we do not support partial submissions, so it's all or nothing
-            NIXL_ERROR << absl::StrFormat("Error preparing I/O operation: %d", status);
-            return status;
-        }
-    }
-
-    return io_queue_->post();
 }
 
 // -----------------------------------------------------------------------------
@@ -247,14 +349,20 @@ nixlPosixBackendReqH::postXfer() {
 
 nixlPosixEngine::nixlPosixEngine(const nixlBackendInitParams *init_params)
     : nixlBackendEngine(init_params),
-      io_queue_type_(getIoQueueType(init_params->customParams)) {
+      io_queue_type_(getIoQueueType(init_params->customParams)),
+      num_threads_(getNumThreads(init_params->customParams)),
+      max_ios_(getMaxIOS(init_params->customParams)),
+      thread_pool_(num_threads_, std::string(io_queue_type_), max_ios_) {
     if (!io_queue_type_) {
         initErr = true;
         NIXL_ERROR << "Failed to initialize POSIX backend - no supported io queue type found";
         return;
     }
-    NIXL_INFO << absl::StrFormat("POSIX backend initialized using io queue type: %s",
-                                 io_queue_type_);
+
+    NIXL_INFO << absl::StrFormat(
+        "POSIX backend initialized using io queue type: %s (num threads: %u)",
+        io_queue_type_,
+        num_threads_);
 }
 
 nixl_status_t
@@ -280,6 +388,9 @@ nixlPosixEngine::prepXfer(const nixl_xfer_op_t &operation,
                           const std::string &remote_agent,
                           nixlBackendReqH *&handle,
                           const nixl_opt_b_args_t *opt_args) const {
+
+    assert(local.descCount() == remote.descCount());
+
     if (!isValidPrepXferParams(operation, local, remote, remote_agent, localAgent)) {
         return NIXL_ERR_INVALID_PARAM;
     }
@@ -291,10 +402,6 @@ nixlPosixEngine::prepXfer(const nixl_xfer_op_t &operation,
 
         auto posix_handle =
             std::make_unique<nixlPosixBackendReqH>(operation, local, remote, opt_args, &params);
-        nixl_status_t status = posix_handle->prepXfer();
-        if (status != NIXL_SUCCESS) {
-            return status;
-        }
 
         handle = posix_handle.release();
         return NIXL_SUCCESS;
@@ -316,19 +423,10 @@ nixlPosixEngine::postXfer(const nixl_xfer_op_t &operation,
                           const std::string &remote_agent,
                           nixlBackendReqH *&handle,
                           const nixl_opt_b_args_t *opt_args) const {
-    try {
-        auto &posix_handle = castPosixHandle(handle);
-        nixl_status_t status = posix_handle.postXfer();
-        if (status != NIXL_IN_PROG) {
-            NIXL_ERROR << "Error in submitting queue";
-        }
-        return status;
-    }
-    catch (const nixlPosixBackendReqH::exception &e) {
-        NIXL_ERROR << e.what();
-        return e.code();
-    }
-    return NIXL_ERR_BACKEND;
+    auto &posix_handle = castPosixHandle(handle);
+    auto thread = dynamic_cast<nixlPosixWorkQueueThread *>(&thread_pool_.getAt(0));
+    posix_handle.queue(thread); // Queue the xfer
+    return NIXL_IN_PROG;
 }
 
 nixl_status_t

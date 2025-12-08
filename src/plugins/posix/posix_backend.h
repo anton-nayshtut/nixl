@@ -24,8 +24,53 @@
 #include <absl/strings/str_format.h>
 #include "backend/backend_engine.h"
 #include "io_queue.h"
+#include "nixl_thread.h"
+
+class nixlPosixBackendReqH;
+
+class nixlPosixWork : public nixlWork {
+public:
+    nixlPosixWork(nixlPosixBackendReqH *req_h);
+    virtual ~nixlPosixWork() = default;
+
+    virtual bool
+    poll() override;
+
+    virtual void
+    destroy() override;
+
+private:
+    nixlPosixBackendReqH *req_h_;
+};
+
+class nixlPosixWorkQueueThread : public nixlWorkQueueThread {
+public:
+    nixlPosixWorkQueueThread(const std::string &io_queue_type, uint32_t max_ios);
+    ~nixlPosixWorkQueueThread() = default;
+
+    nixlPosixIOQueue *
+    ioQueue() const {
+        return io_queue_.get(); // Return the io queue
+    }
+
+    virtual void
+    poll() override;
+
+private:
+    nixl_status_t
+    initIoQueue(const std::string &io_queue_type, uint32_t max_ios);
+
+    std::unique_ptr<nixlPosixIOQueue> io_queue_;
+};
+
 
 class nixlPosixBackendReqH : public nixlBackendReqH {
+    enum class ReqState {
+        IDLE,
+        ENQUEUEING,
+        IN_PROGRESS,
+        COMPLETED,
+    };
 private:
     const nixl_xfer_op_t &operation; // The transfer operation (read/write)
     const nixl_meta_dlist_t &local; // Local memory descriptor list
@@ -33,15 +78,19 @@ private:
     const nixl_opt_b_args_t *opt_args; // Optional backend-specific arguments
     const nixl_b_params_t *custom_params_; // Custom backend parameters
     const int queue_depth_; // Queue depth for async I/O
-    std::unique_ptr<nixlPosixIOQueue> io_queue_; // Async I/O queue instance
-    int num_confirmed_ios_; // Number of confirmed IOs
+    std::atomic<ReqState> req_state_; // Request state
+    size_t num_confirmed_ios_; // Number of confirmed IOs
+    size_t num_submitted_ios_; // Number of submitted IOs
+    nixlPosixWork work_; // Work item for the backend request
+    nixlPosixWorkQueueThread *thread_; // Thread where the work is queued
 
-    nixl_status_t
-    initIoQueue(const std::string &io_queue_type); // Initialize async I/O queue
     void
     ioDone(uint32_t data_size, int error);
     static void
     ioDoneClb(void *ctx, uint32_t data_size, int error);
+
+    bool
+    enqueueXfer();
 
 public:
     nixlPosixBackendReqH(const nixl_xfer_op_t &operation,
@@ -51,10 +100,17 @@ public:
                          const nixl_b_params_t *custom_params);
     ~nixlPosixBackendReqH(){};
 
-    nixl_status_t
-    postXfer();
-    nixl_status_t
-    prepXfer();
+    void
+    queue(nixlPosixWorkQueueThread *thread) {
+        thread_ = thread;
+        num_submitted_ios_ = 0;
+        num_confirmed_ios_ = 0;
+        req_state_ = ReqState::ENQUEUEING;
+        thread_->queue(&work_);
+    }
+
+    bool
+    pollXfer();
     nixl_status_t
     checkXfer();
 
@@ -76,6 +132,9 @@ public:
 class nixlPosixEngine : public nixlBackendEngine {
 private:
     const char *io_queue_type_;
+    uint32_t num_threads_;
+    uint32_t max_ios_;
+    nixlThreadStaticPool<nixlPosixWorkQueueThread> thread_pool_;
 
 public:
     nixlPosixEngine(const nixlBackendInitParams *init_params);
